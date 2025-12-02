@@ -947,7 +947,7 @@ def slurm2sql(db, sacct_filter=['-a'], update=False, jobs_only=False,
                'Time, '
                'TimeLimit, '
                'min(Start) AS Start, '
-               'max(End) AS End, '
+               'max("End") AS "End", '
                'max(NNodes) AS NNodes, '
                'ReqTRES, '
                'max(Elapsed) AS Elapsed, '
