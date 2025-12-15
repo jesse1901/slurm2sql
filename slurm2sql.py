@@ -24,7 +24,7 @@ try:
 except ImportError:
     HAS_DUCKDB = False
 
-__version__ = '0.9.8' 
+__version__ = '0.9.8'
 
 LOG = logging.getLogger('slurm2sql')
 LOG.setLevel(logging.DEBUG)
@@ -46,7 +46,6 @@ def connect_db(filename, use_duckdb=False, read_only=False):
             return duckdb.connect(database=':memory:', read_only=read_only)
         return duckdb.connect(database=filename, read_only=read_only)
     else:
-        # SQLite connection
         return sqlite3.connect(filename)
 
 def get_sql_dialect(db):
@@ -74,6 +73,7 @@ def get_sql_dialect(db):
             'insert_replace': 'INSERT OR REPLACE',
             'regexp_match': "{col} REGEXP {pattern}" 
         }
+
 
 #
 # First, many converter functions/classes which convert strings to
@@ -556,11 +556,6 @@ RE_TRES_CPU = re.compile(rf'\bcpu=([^,]*)\b')
 class slurmCPUEff(linefunc):
     # This matches the seff tool currently:
     #   https://github.com/SchedMD/slurm/blob/master/contribs/seff/seff
-    # Update 2025-10-20: on our slurm TotalCPU is now empty, so we get the CPU value from:
-    #   TRESUsageInTot[cpu] / (AllocTRES[cpu] * Elapsed):
-    #   This is is computed for each job step individually, not for
-    #   the whole job, since the relevant values are only on the job
-    #   steps.  For job efficiency use the `eff` table.
     type = 'real'
     @staticmethod
     def calc(row):
@@ -572,18 +567,12 @@ class slurmCPUEff(linefunc):
         #        return cpueff
         #    except ZeroDivisionError:
         #        return float('nan')
-        if not ('Elapsed' in row and 'AllocTRES' in row and 'TRESUsageInTot' in row):
+        if not ('Elapsed' in row and 'TotalCPU' in row and 'NCPUS' in row):
             return
         walltime = slurmtime(row['Elapsed'])
         if not walltime: return None
-        m_cpu_alloc = RE_TRES_CPU.search(row['AllocTRES'])
-        if not m_cpu_alloc: return None
-        m_cpu_used = RE_TRES_CPU.search(row['TRESUsageInTot'])
-        if not m_cpu_used: return None
-        cpu_alloc = int_metric(m_cpu_alloc.group(1))
-        cpu_used = slurmtime(m_cpu_used.group(1))
         try:
-            cpueff = cpu_used / (walltime * cpu_alloc)
+            cpueff = slurmtime(row['TotalCPU']) / (walltime * int(row['NCPUS']))
         except ZeroDivisionError:
             return float('nan')
         return cpueff
@@ -685,7 +674,7 @@ COLUMNS = {
     'ReqCPUS': nullint,                 # Requested CPUs
     'AllocCPUS': nullint,               # === NCPUS
     'CPUTime': slurmtime,               # = Elapsed * NCPUS    (= CPUTimeRaw)  (not how much used)
-    'TotalCPU': ExtractField("TotalCPU", "TRESUsageInTot", "cpu", slurmtime),   # = Elapsed * NCPUS * efficiency
+    'TotalCPU': slurmtime,              # = Elapsed * NCPUS * efficiency
     'UserCPU': slurmtime,               #
     'SystemCPU': slurmtime,             #
     '_CPUEff': slurmCPUEff,             # CPU efficiency, should be same as seff
@@ -725,8 +714,8 @@ COLUMNS = {
     #'_NGPU': slurmGPUCount,             # Number of GPUs, extracted from comment field
     '_NGpus': ExtractField('NGpus', 'AllocTRES', 'gres/gpu', float_metric),
     '_GpuType': slurmGPUType,            # gres/gpu:TYPE= from AllocTres
-    '_GpuUtil': ExtractField('GpuUtil', 'TRESUsageInTot', 'gres/gpuutil', float_metric, wrap=lambda x: x/100.), # can be >100 for multi-GPU.
-    '_GpuMem': ExtractField('GpuMem2', 'TRESUsageInTot', 'gres/gpumem', float_metric),
+    '_GpuUtil': ExtractField('GpuUtil', 'TRESUsageInAve', 'gres/gpuutil', float_metric, wrap=lambda x: x/100.), # can be >100 for multi-GPU.
+    '_GpuMem': ExtractField('GpuMem2', 'TRESUsageInAve', 'gres/gpumem', float_metric),
     '_GpuUtilTot': ExtractField('GpuUtilTot', 'TRESUsageInTot', 'gres/gpuutil', float_metric),
     '_GpuMemTot': ExtractField('GpuMemTot',   'TRESUsageInTot', 'gres/gpumem', float_metric),
     }
@@ -904,7 +893,7 @@ def create_indexes(db):
     db.execute('CREATE INDEX IF NOT EXISTS idx_slurm_user_start ON slurm (User, Start)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_slurm_time ON slurm (Time)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_slurm_user_time ON slurm (User, Time)')
-
+    
     if 'duckdb' not in str(type(db)).lower():
         db.execute('ANALYZE;')
     db.commit()
@@ -953,10 +942,10 @@ def sacct_iter(slurm_cols, sacct_filter, errors=[0], raw_sacct=None):
 def slurm2sql(db, sacct_filter=['-a'], update=False, jobs_only=False,
               raw_sacct=None, verbose=False,
               csv_input=None):
-    """Import one call of sacct to a sqlite/duckdb database.
+    """Import one call of sacct to a sqlite database.
 
     db:
-    open sqlite3 or duckdb database file object.
+    open sqlite3 database file object.
 
     sacct_filter:
     filter for sacct, list of arguments.  This should only be row
@@ -989,20 +978,20 @@ def slurm2sql(db, sacct_filter=['-a'], update=False, jobs_only=False,
                'max(Partition) AS Partition, ' 
                'max(JobName) AS JobName, ' 
                'group_concat(SubmitLine, \'\n\') AS SubmitLines, ' 
-               'group_concat(Account) As Account, ' 
+               'group_concat(DISTINCT Account) As Account, ' 
                '(SELECT State FROM allocations AS allocations2 WHERE allocations2.jobid=slurm1.JobIDnostep) AS State, ' 
-               'group_concat(NodeList) AS NodeList, ' 
-               'max(Time), ' 
-               'max(TimeLimit), ' 
+               'group_concat(DISTINCT NodeList) AS NodeList, ' 
+               'max(Time) AS Time, ' 
+               'max(TimeLimit) AS TimeLimit, ' 
                'min(Start) AS Start, ' 
                'max("End") AS "End", ' 
                'max(NNodes) AS NNodes, ' 
                'max(ReqTRES) AS ReqTRES, ' 
                'max(Elapsed) AS Elapsed, ' 
                'max(NCPUS) AS NCPUS, ' 
-               'sum(totalcpu)/max(cputime) AS CPUeff, ' 
+               'max(totalcpu)/max(cputime) AS CPUeff, ' 
                'max(cputime) AS cpu_s_reserved, ' 
-               'sum(totalcpu) AS cpu_s_used, ' 
+               'max(totalcpu) AS cpu_s_used, ' 
                'max(ReqMemNode) AS MemReq, ' 
                'max(AllocMem) AS AllocMem, ' 
                'max(TotalMem) AS TotalMem, ' 
@@ -1020,7 +1009,6 @@ def slurm2sql(db, sacct_filter=['-a'], update=False, jobs_only=False,
                'sum(TotDiskRead) as TotDiskRead, ' 
                'sum(TotDiskWrite) as TotDiskWrite ' 
                'FROM slurm AS slurm1 GROUP BY JobIDnostep')
-    
     #db.execute('PRAGMA journal_mode = WAL;')
     db.commit()
     
